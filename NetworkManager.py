@@ -6,6 +6,7 @@ needed only for network changes. Profile files remain compatible with the PS ver
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import ipaddress
 import json
@@ -78,6 +79,32 @@ def run_powershell(script: str, timeout: int = 45) -> str:
 
 def ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def is_administrator() -> bool:
+    """Return whether Windows started this process with elevated rights."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def user_friendly_error(error: Exception) -> str:
+    """Keep PowerShell diagnostic output in the log, not in a GUI dialog."""
+    details = str(error).strip()
+    lower = details.lower()
+    if "set-netadapteradvancedproperty" in lower:
+        if "permissiondenied" in lower or "access is denied" in lower or "access denied" in lower:
+            return ("Не удалось изменить VLAN: Windows требует права администратора.\n\n"
+                    "Закройте программу и запустите Start-Python.bat через «Запуск от имени администратора».")
+        return ("Не удалось изменить VLAN в драйвере сетевого адаптера. "
+                "Проверьте поддержку VLAN драйвером и права администратора.")
+    if "permissiondenied" in lower or "access is denied" in lower or "access denied" in lower:
+        return ("Windows отклонила изменение сетевых параметров.\n\n"
+                "Закройте программу и запустите Start-Python.bat через «Запуск от имени администратора».")
+    if "#< clixml" in lower:
+        return "Не удалось применить сетевые параметры. Технические сведения сохранены в журнале Logs."
+    return details or "Не удалось выполнить операцию. Технические сведения сохранены в журнале Logs."
 
 
 def mask_from(value: str) -> str:
@@ -180,7 +207,12 @@ class NetworkBackend:
 
     def apply(self, name: str, profile: dict[str, Any]) -> None:
         validate_profile(profile)
-        self.ensure_snapshot(name)
+        current_state = self.state(name)
+        changes_vlan = profile.get("VLAN") not in (None, "") or bool(current_state.get("VlanValue"))
+        if changes_vlan and not is_administrator():
+            raise PermissionError("Для изменения или сброса VLAN требуются права администратора. "
+                                  "Закройте программу и запустите Start-Python.bat через «Запуск от имени администратора».")
+        self.ensure_snapshot(name, current_state)
         p64 = base64.b64encode(json.dumps(profile, ensure_ascii=False).encode("utf-8")).decode("ascii")
         n = ps_quote(name)
         # VLAN property discovery uses known numeric ID properties only; the
@@ -188,6 +220,10 @@ class NetworkBackend:
         keys = ",".join(ps_quote(k) for k in VLAN_KEYS)
         script = f"""$ErrorActionPreference='Stop'; $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{p64}')) | ConvertFrom-Json; $n={n}; $keys=@({keys}); $vlan=$null; if($null -ne $p.VLAN -and [string]$p.VLAN -ne ''){{$vlan=[int]$p.VLAN}}; $props=@(Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction Stop); $prop=$props | Where-Object {{$_.RegistryKeyword -in $keys}} | Select-Object -First 1; if(-not $prop){{$prop=$props | Where-Object {{$_.DisplayName -match '^VLAN\\s*ID$' -and $_.DisplayName -notmatch 'Priority'}} | Select-Object -First 1}}; if($null -ne $vlan){{if(-not $prop){{throw 'Драйвер не предоставляет подтверждённый параметр VLAN ID; IPv4 не менялся.'}}; Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -RegistryValue ([string]$vlan) -ErrorAction Stop}} elseif($prop -and $prop.RegistryValue -and [string]$prop.RegistryValue[0] -ne ''){{if($prop.Optional){{Remove-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -NoRestart -Confirm:$false -ErrorAction Stop}}elseif($prop.DefaultRegistryValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -RegistryValue ([string]$prop.DefaultRegistryValue[0]) -NoRestart -ErrorAction Stop}}else{{throw 'Для найденного VLAN-драйвера не определён безопасный способ сброса; IPv4 не менялся.'}}}}; Start-Sleep -Seconds 2; $mode=[string]$p.Mode; if($mode -eq 'Network'){{& netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+[string]$p.IP) ('mask='+[string]$p.Mask) $(if($p.Gateway){{'gateway='+[string]$p.Gateway}}else{{'gateway=none'}}) store=persistent | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка настройки IPv4'}}}}; if($mode -in @('MultiAddress','Mixed')){{$a=@($p.Addresses); if($a.Count -gt 0){{& netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+[string]$a[0].IP) ('mask='+[string]$a[0].Mask) gateway=none store=active | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка IPv4'}}; for($i=1;$i -lt $a.Count;$i++){{& netsh.exe interface ipv4 add address ('name='+$n) ('address='+[string]$a[$i].IP) ('mask='+[string]$a[$i].Mask) store=active | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка дополнительного IPv4'}}}}}}}}; if($mode -in @('Routes','Mixed')){{foreach($r in @($p.Routes)){{$args=@('add',[string]$r.Destination,'mask',[string]$r.Mask,[string]$r.Gateway); if($p.Persistent){{$args=@('-p')+$args}}; & route.exe @args | Out-Null; if($LASTEXITCODE -ne 0){{throw ('Не удалось добавить маршрут '+$r.Destination)}}}}}}"""
         script += "; if($mode -eq 'DHCP'){Get-NetRoute -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -and $_.NextHop -ne '0.0.0.0'} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.PrefixOrigin -ne 'WellKnown'} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop; if($p.DnsServers -and @($p.DnsServers).Count -gt 0){Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($p.DnsServers) -ErrorAction Stop}else{Set-DnsClientServerAddress -InterfaceAlias $n -ResetServerAddresses -ErrorAction Stop}; Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 3; & ipconfig.exe /renew $n | Out-Null; if($p.Routes){foreach($r in $p.Routes){$ra=@('add',[string]$r.Destination,'mask',[string]$r.Mask,[string]$r.Gateway); if($p.Persistent){$ra=@('-p')+$ra}; & route.exe @ra | Out-Null; if($LASTEXITCODE -ne 0){throw ('Не удалось добавить маршрут '+$r.Destination)}}}}; if($mode -ne 'DHCP' -and $p.DnsServers -and @($p.DnsServers).Count -gt 0){Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($p.DnsServers) -ErrorAction Stop}"
+        script = script.replace(
+            "elseif($prop -and $prop.RegistryValue -and [string]$prop.RegistryValue[0] -ne '')",
+            "elseif($prop -and $prop.RegistryValue -and [string]$prop.RegistryValue[0] -ne '' -and [string]$prop.RegistryValue[0] -ne '0' -and (-not $prop.DefaultRegistryValue -or [string]$prop.RegistryValue[0] -ne [string]$prop.DefaultRegistryValue[0]))",
+        )
         run_powershell(script, timeout=90)
 
     def dhcp(self, name: str) -> None:
@@ -765,8 +801,9 @@ class NetworkManagerApp(tk.Tk):
                 self.after(0, completed)
             except Exception as e:
                 error_text = str(e)
+                display_error = user_friendly_error(e)
                 logging.exception("%s failed", pending)
-                self.after(0, lambda: (self.status_var.set("Операция завершилась ошибкой"), messagebox.showerror("Ошибка операции", error_text, parent=self)))
+                self.after(0, lambda: (self.status_var.set("Операция завершилась ошибкой"), messagebox.showerror("Ошибка операции", display_error, parent=self)))
             finally:
                 if refresh: self.after(1500, self.refresh_state)
         threading.Thread(target=work, daemon=True).start()
