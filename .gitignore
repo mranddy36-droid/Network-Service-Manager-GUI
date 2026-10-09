@@ -1,0 +1,23 @@
+# Runtime data created for a specific computer or user
+Profiles/
+Snapshots/
+Logs/
+PythonSettings.json
+OriginalNetworkState*.json
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Build and packaging output
+build/
+dist/
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

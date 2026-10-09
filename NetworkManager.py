@@ -6,6 +6,7 @@ needed only for network changes. Profile files remain compatible with the PS ver
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -25,6 +26,7 @@ APP_DIR = Path(__file__).resolve().parent
 PROFILES_DIR = APP_DIR / "Profiles"
 LOG_DIR = APP_DIR / "Logs"
 SNAPSHOT = APP_DIR / "OriginalNetworkState.json"
+SNAPSHOT_DIR = APP_DIR / "Snapshots"
 SETTINGS = APP_DIR / "PythonSettings.json"
 APP_NAME = "Network Service Manager"
 VLAN_KEYS = ("VLAN_ID", "RegVlanID", "VlanID", "VLANID", "*VlanID")
@@ -33,12 +35,14 @@ MODE_LABELS = {
     "MultiAddress": "Несколько IP-адресов",
     "Routes": "Только маршруты",
     "Mixed": "IP-адреса и маршруты",
+    "DHCP": "Автоматически (DHCP)",
 }
 MODE_DESCRIPTIONS = {
     "Network": "Назначает один статический IPv4-адрес и маску. Можно указать шлюз и VLAN. Подходит для обычного подключения к одному устройству или сети.",
     "MultiAddress": "Назначает несколько IPv4-адресов одному адаптеру. Используйте, если к устройству нужно обращаться из нескольких подсетей. Можно указать VLAN.",
     "Routes": "Добавляет маршруты до удалённых подсетей через указанные шлюзы. IP-адрес адаптера не меняется. Подходит, когда адаптер уже настроен.",
     "Mixed": "Сначала назначает несколько IPv4-адресов, затем добавляет маршруты. Используйте, когда нужны и адреса для локальных подсетей, и пути к удалённым сетям. Можно указать VLAN.",
+    "DHCP": "Автоматически получает IPv4-адрес, шлюз и DNS от DHCP-сервера. Можно задать VLAN и дополнительные маршруты. Ручные IPv4-поля не нужны.",
 }
 
 
@@ -93,8 +97,8 @@ def validate_profile(p: dict[str, Any]) -> None:
         raise ValueError("В профиле должно быть непустое поле Name")
     mode = p.get("Mode") or ("Mixed" if "Addresses" in p and "Routes" in p else
                               "MultiAddress" if "Addresses" in p else "Routes" if "Routes" in p else "Network")
-    if mode not in ("Network", "MultiAddress", "Routes", "Mixed"):
-        raise ValueError("Mode должен быть Network, MultiAddress, Routes или Mixed")
+    if mode not in ("Network", "MultiAddress", "Routes", "Mixed", "DHCP"):
+        raise ValueError("Неизвестный тип профиля")
     p["Mode"] = mode
     if p.get("VLAN") not in (None, ""):
         p["VLAN"] = int(p["VLAN"])
@@ -111,8 +115,8 @@ def validate_profile(p: dict[str, Any]) -> None:
         for a in p.get("Addresses", []):
             ipaddress.IPv4Address(a["IP"])
             a["Mask"] = mask_from(str(a.get("Mask", "24")))
-    if mode in ("Routes", "Mixed"):
-        if not p.get("Routes"):
+    if mode in ("Routes", "Mixed", "DHCP"):
+        if mode != "DHCP" and not p.get("Routes"):
             raise ValueError("Добавьте хотя бы один маршрут")
         for r in p.get("Routes", []):
             ipaddress.IPv4Address(r["Destination"])
@@ -131,7 +135,7 @@ class NetworkBackend:
 
     def state(self, name: str) -> dict[str, Any]:
         n = ps_quote(name)
-        script = f"""$ErrorActionPreference='Stop'; $a=Get-NetAdapter -Name {n}; $ip=Get-NetIPInterface -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1; $ad=@(Get-NetIPAddress -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*'}} | Select-Object IPAddress,PrefixLength,PrefixOrigin); $gw=@(Get-NetRoute -InterfaceAlias {n} -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {{$_.NextHop -and $_.NextHop -ne '0.0.0.0'}} | Sort-Object RouteMetric | Select-Object -ExpandProperty NextHop -Unique); $routes=@(Get-NetRoute -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.DestinationPrefix -ne '0.0.0.0/0'}} | Select-Object DestinationPrefix,NextHop); $dns=@(Get-DnsClientServerAddress -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{$_.ServerAddresses}}); $props=@(Get-NetAdapterAdvancedProperty -Name {n} -AllProperties -ErrorAction SilentlyContinue); $v=$props | Where-Object {{$_.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)})}} | Select-Object -First 1; if(-not $v){{$v=$props | Where-Object {{$_.DisplayName -match '^VLAN\\s*ID$' -and $_.DisplayName -notmatch 'Priority'}} | Select-Object -First 1}}; $supports=$false; if($v -and ($v.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)} ) -or $v.DisplayName -match '^VLAN\\s*ID$')){{$supports=$true}}; $vlanValue=''; if($v -and $v.RegistryValue -and [string]$v.RegistryValue[0] -ne ''){{$vlanValue=[string]$v.RegistryValue[0]; if($vlanValue -eq '0' -or ($v.DefaultRegistryValue -and $vlanValue -eq [string]$v.DefaultRegistryValue[0])){{$vlanValue=''}}}}; [pscustomobject]@{{Name=$a.Name;Guid=[string]$a.InterfaceGuid;Status=[string]$a.Status;LinkSpeed=[string]$a.LinkSpeed;Dhcp=[string]$ip.Dhcp;Addresses=$ad;Gateways=$gw;Routes=$routes;DnsServers=$dns;VlanKeyword=[string]$v.RegistryKeyword;VlanValue=$vlanValue;VlanSupported=$supports}} | ConvertTo-Json -Depth 6 -Compress"""
+        script = f"""$ErrorActionPreference='Stop'; $a=Get-NetAdapter -Name {n}; $ip=Get-NetIPInterface -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1; $ad=@(Get-NetIPAddress -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*'}} | Select-Object IPAddress,PrefixLength,PrefixOrigin); $gw=@(Get-NetRoute -InterfaceAlias {n} -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object {{$_.NextHop -and $_.NextHop -ne '0.0.0.0'}} | Sort-Object RouteMetric | Select-Object -ExpandProperty NextHop -Unique); $routes=@(Get-NetRoute -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.DestinationPrefix -ne '0.0.0.0/0' -and $_.Protocol -ne 'Dhcp'}} | Select-Object DestinationPrefix,NextHop); $dns=@(Get-DnsClientServerAddress -InterfaceAlias {n} -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{$_.ServerAddresses}}); $props=@(Get-NetAdapterAdvancedProperty -Name {n} -AllProperties -ErrorAction SilentlyContinue); $v=$props | Where-Object {{$_.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)})}} | Select-Object -First 1; if(-not $v){{$v=$props | Where-Object {{$_.DisplayName -match '^VLAN\\s*ID$' -and $_.DisplayName -notmatch 'Priority'}} | Select-Object -First 1}}; $supports=$false; if($v -and ($v.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)} ) -or $v.DisplayName -match '^VLAN\\s*ID$')){{$supports=$true}}; $vlanValue=''; if($v -and $v.RegistryValue -and [string]$v.RegistryValue[0] -ne ''){{$vlanValue=[string]$v.RegistryValue[0]; if($vlanValue -eq '0' -or ($v.DefaultRegistryValue -and $vlanValue -eq [string]$v.DefaultRegistryValue[0])){{$vlanValue=''}}}}; [pscustomobject]@{{Name=$a.Name;Guid=[string]$a.InterfaceGuid;Status=[string]$a.Status;LinkSpeed=[string]$a.LinkSpeed;Dhcp=[string]$ip.Dhcp;Addresses=$ad;Gateways=$gw;Routes=$routes;DnsServers=$dns;VlanKeyword=[string]$v.RegistryKeyword;VlanValue=$vlanValue;VlanSupported=$supports}} | ConvertTo-Json -Depth 6 -Compress"""
         result = json.loads(run_powershell(script) or "{}")
         if not isinstance(result.get("Addresses"), list):
             result["Addresses"] = [result["Addresses"]] if result.get("Addresses") else []
@@ -149,13 +153,30 @@ class NetworkBackend:
         result["Routes"] = parsed_routes
         return result
 
-    def ensure_snapshot(self, name: str) -> None:
-        if SNAPSHOT.exists():
+    @staticmethod
+    def snapshot_path(name: str) -> Path:
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")[:40] or "adapter"
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+        return SNAPSHOT_DIR / f"{slug}_{digest}.json"
+
+    def ensure_snapshot(self, name: str, state: dict[str, Any] | None = None) -> None:
+        path = self.snapshot_path(name)
+        if path.exists():
             return
-        state = self.state(name)
-        SNAPSHOT.write_text(json.dumps({**state, "AdapterName": name,
-                                        "SavedAt": datetime.now().isoformat(timespec="seconds")},
-                                       ensure_ascii=False, indent=2), encoding="utf-8")
+        SNAPSHOT_DIR.mkdir(exist_ok=True)
+        # Import the legacy snapshot when it belongs to this adapter.
+        if SNAPSHOT.exists():
+            try:
+                legacy = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+                if legacy.get("AdapterName") == name:
+                    path.write_text(json.dumps(legacy, ensure_ascii=False, indent=2), encoding="utf-8")
+                    return
+            except (OSError, json.JSONDecodeError):
+                pass
+        state = state or self.state(name)
+        path.write_text(json.dumps({**state, "AdapterName": name,
+                                    "SavedAt": datetime.now().isoformat(timespec="seconds")},
+                                   ensure_ascii=False, indent=2), encoding="utf-8")
 
     def apply(self, name: str, profile: dict[str, Any]) -> None:
         validate_profile(profile)
@@ -166,7 +187,7 @@ class NetworkBackend:
         # Priority & VLAN toggle is deliberately never mistaken for a VLAN ID.
         keys = ",".join(ps_quote(k) for k in VLAN_KEYS)
         script = f"""$ErrorActionPreference='Stop'; $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{p64}')) | ConvertFrom-Json; $n={n}; $keys=@({keys}); $vlan=$null; if($null -ne $p.VLAN -and [string]$p.VLAN -ne ''){{$vlan=[int]$p.VLAN}}; $props=@(Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction Stop); $prop=$props | Where-Object {{$_.RegistryKeyword -in $keys}} | Select-Object -First 1; if(-not $prop){{$prop=$props | Where-Object {{$_.DisplayName -match '^VLAN\\s*ID$' -and $_.DisplayName -notmatch 'Priority'}} | Select-Object -First 1}}; if($null -ne $vlan){{if(-not $prop){{throw 'Драйвер не предоставляет подтверждённый параметр VLAN ID; IPv4 не менялся.'}}; Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -RegistryValue ([string]$vlan) -ErrorAction Stop}} elseif($prop -and $prop.RegistryValue -and [string]$prop.RegistryValue[0] -ne ''){{if($prop.Optional){{Remove-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -NoRestart -Confirm:$false -ErrorAction Stop}}elseif($prop.DefaultRegistryValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $prop.RegistryKeyword -RegistryValue ([string]$prop.DefaultRegistryValue[0]) -NoRestart -ErrorAction Stop}}else{{throw 'Для найденного VLAN-драйвера не определён безопасный способ сброса; IPv4 не менялся.'}}}}; Start-Sleep -Seconds 2; $mode=[string]$p.Mode; if($mode -eq 'Network'){{& netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+[string]$p.IP) ('mask='+[string]$p.Mask) $(if($p.Gateway){{'gateway='+[string]$p.Gateway}}else{{'gateway=none'}}) store=persistent | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка настройки IPv4'}}}}; if($mode -in @('MultiAddress','Mixed')){{$a=@($p.Addresses); if($a.Count -gt 0){{& netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+[string]$a[0].IP) ('mask='+[string]$a[0].Mask) gateway=none store=active | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка IPv4'}}; for($i=1;$i -lt $a.Count;$i++){{& netsh.exe interface ipv4 add address ('name='+$n) ('address='+[string]$a[$i].IP) ('mask='+[string]$a[$i].Mask) store=active | Out-Null; if($LASTEXITCODE -ne 0){{throw 'netsh: ошибка дополнительного IPv4'}}}}}}}}; if($mode -in @('Routes','Mixed')){{foreach($r in @($p.Routes)){{$args=@('add',[string]$r.Destination,'mask',[string]$r.Mask,[string]$r.Gateway); if($p.Persistent){{$args=@('-p')+$args}}; & route.exe @args | Out-Null; if($LASTEXITCODE -ne 0){{throw ('Не удалось добавить маршрут '+$r.Destination)}}}}}}"""
-        script += "; if($p.DnsServers -and @($p.DnsServers).Count -gt 0){Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($p.DnsServers) -ErrorAction Stop}"
+        script += "; if($mode -eq 'DHCP'){Get-NetRoute -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.NextHop -and $_.NextHop -ne '0.0.0.0'} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.PrefixOrigin -ne 'WellKnown'} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop; if($p.DnsServers -and @($p.DnsServers).Count -gt 0){Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($p.DnsServers) -ErrorAction Stop}else{Set-DnsClientServerAddress -InterfaceAlias $n -ResetServerAddresses -ErrorAction Stop}; Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 3; & ipconfig.exe /renew $n | Out-Null; if($p.Routes){foreach($r in $p.Routes){$ra=@('add',[string]$r.Destination,'mask',[string]$r.Mask,[string]$r.Gateway); if($p.Persistent){$ra=@('-p')+$ra}; & route.exe @ra | Out-Null; if($LASTEXITCODE -ne 0){throw ('Не удалось добавить маршрут '+$r.Destination)}}}}; if($mode -ne 'DHCP' -and $p.DnsServers -and @($p.DnsServers).Count -gt 0){Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($p.DnsServers) -ErrorAction Stop}"
         run_powershell(script, timeout=90)
 
     def dhcp(self, name: str) -> None:
@@ -177,14 +198,22 @@ class NetworkBackend:
         run_powershell(script, timeout=35)
 
     def restore(self, name: str) -> None:
-        if not SNAPSHOT.exists():
+        path = self.snapshot_path(name)
+        if not path.exists() and SNAPSHOT.exists():
+            try:
+                legacy = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+                if legacy.get("AdapterName") == name:
+                    path = SNAPSHOT
+            except (OSError, json.JSONDecodeError):
+                pass
+        if not path.exists():
             raise RuntimeError("Снимок исходного состояния ещё не создан")
-        snap = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+        snap = json.loads(path.read_text(encoding="utf-8"))
         if snap.get("AdapterName") != name:
             raise RuntimeError(f"Снимок относится к адаптеру {snap.get('AdapterName')}")
         s64 = base64.b64encode(json.dumps(snap).encode()).decode()
         n = ps_quote(name)
-        script = f"""$ErrorActionPreference='Stop'; function Mask([int]$p){{$b=('1'*$p).PadRight(32,'0'); return (0,8,16,24 | ForEach-Object {{[Convert]::ToInt32($b.Substring($_,8),2)}}) -join '.'}}; $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{s64}')) | ConvertFrom-Json; $n={n}; $v=Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction Stop | Where-Object {{$_.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)})}} | Select-Object -First 1; if($v -and $v.RegistryValue -and [string]$v.RegistryValue[0] -ne ''){{if($v.Optional){{Remove-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $v.RegistryKeyword -NoRestart -Confirm:$false -ErrorAction Stop}}elseif($v.DefaultRegistryValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $v.RegistryKeyword -RegistryValue ([string]$v.DefaultRegistryValue[0]) -NoRestart -ErrorAction Stop}}else{{throw 'Нельзя безопасно отключить текущий VLAN; восстановление остановлено.'}}}}; Get-NetRoute -InterfaceAlias $n -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.PrefixOrigin -ne 'WellKnown'}} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; if($s.VlanKeyword -and $s.VlanValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $s.VlanKeyword -RegistryValue ([string]$s.VlanValue) -NoRestart -ErrorAction Stop}}; if($s.Dhcp -eq 'Enabled'){{Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop}}else{{$a=@($s.Addresses); if($a.Count -gt 0){{$mask=Mask ([int]$a[0].PrefixLength); $gw=@($s.Gateways) | Select-Object -First 1; & netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+$a[0].IPAddress) ('mask='+$mask) $(if($gw){{'gateway='+$gw}}else{{'gateway=none'}}) store=persistent | Out-Null; for($i=1;$i -lt $a.Count;$i++){{$mask=Mask ([int]$a[$i].PrefixLength); & netsh.exe interface ipv4 add address ('name='+$n) ('address='+$a[$i].IPAddress) ('mask='+$mask) store=persistent | Out-Null}}}}}}; if(@($s.DnsServers).Count){{Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($s.DnsServers) -ErrorAction Stop}}else{{Set-DnsClientServerAddress -InterfaceAlias $n -ResetServerAddresses -ErrorAction Stop}}; Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop"""
+        script = f"""$ErrorActionPreference='Stop'; function Mask([int]$p){{$b=('1'*$p).PadRight(32,'0'); return (0,8,16,24 | ForEach-Object {{[Convert]::ToInt32($b.Substring($_,8),2)}}) -join '.'}}; $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{s64}')) | ConvertFrom-Json; $n={n}; $v=Get-NetAdapterAdvancedProperty -Name $n -AllProperties -ErrorAction Stop | Where-Object {{$_.RegistryKeyword -in @({','.join(ps_quote(k) for k in VLAN_KEYS)})}} | Select-Object -First 1; if($v -and $v.RegistryValue -and [string]$v.RegistryValue[0] -ne ''){{if($v.Optional){{Remove-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $v.RegistryKeyword -NoRestart -Confirm:$false -ErrorAction Stop}}elseif($v.DefaultRegistryValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $v.RegistryKeyword -RegistryValue ([string]$v.DefaultRegistryValue[0]) -NoRestart -ErrorAction Stop}}else{{throw 'Нельзя безопасно отключить текущий VLAN; восстановление остановлено.'}}}}; Get-NetRoute -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.NextHop -and $_.NextHop -ne '0.0.0.0'}} | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{$_.PrefixOrigin -ne 'WellKnown'}} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; if($s.VlanKeyword -and $s.VlanValue){{Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $s.VlanKeyword -RegistryValue ([string]$s.VlanValue) -NoRestart -ErrorAction Stop}}; if($s.Dhcp -eq 'Enabled'){{Set-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop}}else{{$a=@($s.Addresses); if($a.Count -gt 0){{$mask=Mask ([int]$a[0].PrefixLength); $gw=@($s.Gateways) | Select-Object -First 1; & netsh.exe interface ipv4 set address ('name='+$n) source=static ('address='+$a[0].IPAddress) ('mask='+$mask) $(if($gw){{'gateway='+$gw}}else{{'gateway=none'}}) store=persistent | Out-Null; for($i=1;$i -lt $a.Count;$i++){{$mask=Mask ([int]$a[$i].PrefixLength); & netsh.exe interface ipv4 add address ('name='+$n) ('address='+$a[$i].IPAddress) ('mask='+$mask) store=persistent | Out-Null}}}}}}; foreach($r in @($s.Routes)){{& route.exe add ([string]$r.Destination) mask ([string]$r.Mask) ([string]$r.Gateway) | Out-Null}}; if(@($s.DnsServers).Count){{Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @($s.DnsServers) -ErrorAction Stop}}else{{Set-DnsClientServerAddress -InterfaceAlias $n -ResetServerAddresses -ErrorAction Stop}}; Restart-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop"""
         run_powershell(script, timeout=60)
 
 
@@ -288,19 +317,23 @@ class ProfileEditor(tk.Toplevel):
             self.add_labeled_entry(box, "Шлюз", self.gateway_var, 1, 0)
             ttk.Label(box, text="Например: 192.168.1.20 / 255.255.255.0", foreground="#687386").grid(
                 row=2, column=1, columnspan=3, sticky="w")
+        if mode == "DHCP":
+            box = ttk.LabelFrame(self.mode_fields, text="Автоматическая настройка", padding=12); box.pack(fill="x", pady=4)
+            ttk.Label(box, text="IP-адрес, шлюз и DNS будут получены от DHCP-сервера.",
+                      wraplength=600, justify="left").pack(anchor="w")
         if mode in ("MultiAddress", "Mixed"):
             box = ttk.LabelFrame(self.mode_fields, text="Дополнительные IPv4 адреса", padding=10); box.pack(fill="x", pady=4)
             self.address_list = ttk.Frame(box); self.address_list.pack(fill="x")
             for ip, mask in self.address_cache: self.add_address_row(ip, mask)
             ttk.Button(box, text="＋ Добавить IP-адрес", command=self.add_address_row).pack(anchor="w", pady=(8, 0))
             if not self.address_rows: self.add_address_row()
-        if mode in ("Routes", "Mixed"):
+        if mode in ("Routes", "Mixed", "DHCP"):
             box = ttk.LabelFrame(self.mode_fields, text="Маршруты", padding=10); box.pack(fill="x", pady=4)
             self.route_list = ttk.Frame(box); self.route_list.pack(fill="x")
             for destination, mask, gateway in self.route_cache:
                 self.add_route_row(destination, mask, gateway)
             ttk.Button(box, text="＋ Добавить маршрут", command=self.add_route_row).pack(anchor="w", pady=(8, 0))
-            if not self.route_rows: self.add_route_row()
+            if mode != "DHCP" and not self.route_rows: self.add_route_row()
             ttk.Checkbutton(box, text="Сделать маршруты постоянными", variable=self.persistent_var).pack(anchor="w", pady=(8, 0))
 
     def add_address_row(self, ip: str = "", mask: str = "255.255.255.0") -> None:
@@ -344,6 +377,14 @@ class ProfileEditor(tk.Toplevel):
                 p["Addresses"] = [{"IP": ip.get().strip(), "Mask": mask.get().strip()} for ip, mask in self.address_rows]
                 p.pop("IP", None); p.pop("Mask", None); p.pop("Gateway", None)
                 if mode == "MultiAddress": p.pop("Routes", None); p.pop("Persistent", None)
+            elif mode == "DHCP":
+                p.pop("IP", None); p.pop("Mask", None); p.pop("Gateway", None); p.pop("Addresses", None)
+                if self.route_rows:
+                    p["Routes"] = [{"Destination": d.get().strip(), "Mask": mask.get().strip(), "Gateway": gateway.get().strip()}
+                                    for d, mask, gateway in self.route_rows]
+                    p["Persistent"] = self.persistent_var.get()
+                else:
+                    p.pop("Routes", None); p.pop("Persistent", None)
             else:
                 p.pop("IP", None); p.pop("Mask", None); p.pop("Gateway", None); p.pop("Addresses", None)
             if mode in ("Routes", "Mixed"):
@@ -398,6 +439,12 @@ class NetworkManagerApp(tk.Tk):
         self.adapter_combo.pack(side="left", padx=(0, 8)); self.adapter_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_state())
         ttk.Button(adapter_bar, text="Обновить", command=self.refresh_adapters).pack(side="left")
         self.state_label = ttk.Label(adapter_bar, text=""); self.state_label.pack(side="left", padx=18)
+        recovery = ttk.LabelFrame(self, text="Восстановление сети", padding=(8, 6)); recovery.pack(fill="x", pady=5)
+        ttk.Button(recovery, text="Включить DHCP и DNS", style="Accent.TButton",
+                   command=self.restore_dhcp).pack(side="left", padx=(0, 8))
+        ttk.Button(recovery, text="Вернуть исходные настройки", command=self.restore_original).pack(side="left")
+        ttk.Label(recovery, text="Исходные параметры сохраняются отдельно для каждого адаптера.",
+                  foreground="#687386").pack(side="left", padx=12)
         objbar = ttk.LabelFrame(self, text="ШАГ 2 · Объект с профилями", padding=10); objbar.pack(fill="x", pady=5)
         self.object_combo = ttk.Combobox(objbar, textvariable=self.object_var, state="readonly", width=40)
         self.object_combo.pack(side="left", padx=(0, 8)); self.object_combo.bind("<<ComboboxSelected>>", lambda _e: self.load_object())
@@ -433,8 +480,6 @@ class NetworkManagerApp(tk.Tk):
         self.detail_text = tk.Text(right, wrap="word", state="disabled", font=("Consolas", 10))
         self.detail_text.pack(fill="both", expand=True)
         bottom = ttk.Frame(self); bottom.pack(fill="x")
-        ttk.Button(bottom, text="Вернуть DHCP / DNS", command=self.restore_dhcp).pack(side="left", padx=(0, 6))
-        ttk.Button(bottom, text="Восстановить исходные настройки", command=self.restore_original).pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="Проверить связь (ping)", command=self.manual_ping).pack(side="left", padx=(0, 6))
         ttk.Label(bottom, textvariable=self.status_var, anchor="e").pack(side="right", fill="x", expand=True)
         if self.settings.get("dark"):
@@ -502,6 +547,12 @@ class NetworkManagerApp(tk.Tk):
         def work():
             try:
                 s = self.backend.state(name)
+                try:
+                    self.backend.ensure_snapshot(name, s)
+                    snapshot_error = ""
+                except Exception as e:
+                    snapshot_error = str(e)
+                    logging.exception("Не удалось сохранить исходные параметры адаптера %s", name)
                 def show():
                     ips = ", ".join(f"{x['IPAddress']}/{x['PrefixLength']}" for x in s.get("Addresses", [])) or "—"
                     self.state_label.configure(text=f"{s.get('Status')} · VLAN {s.get('VlanValue') or 'нет'} · {ips}")
@@ -510,7 +561,8 @@ class NetworkManagerApp(tk.Tk):
                             f"VLAN ID подтверждён: {'да' if s.get('VlanSupported') else 'нет'}", f"DHCP: {s.get('Dhcp') or 'неизвестно'}",
                             f"IPv4: {ips}", f"Шлюз: {', '.join(s.get('Gateways', [])) or '—'}", f"DNS: {', '.join(s.get('DnsServers', [])) or '—'}",
                             f"Маршрутов через шлюз: {len(s.get('Routes', []))}"]
-                    self.set_text(self.state_text, "\n".join(rows)); self.status_var.set("Состояние обновлено")
+                    self.set_text(self.state_text, "\n".join(rows))
+                    self.status_var.set(f"Не сохранён снимок исходных настроек: {snapshot_error}" if snapshot_error else "Состояние обновлено")
                 self.after(0, show)
             except Exception as e:
                 error_text = str(e)
@@ -548,6 +600,7 @@ class NetworkManagerApp(tk.Tk):
             mode_label = MODE_LABELS.get(mode, mode)
             vlan = f"{p.get('VLAN')}" if p.get("VLAN") else "нет"
             if mode == "Network": detail = f"{p.get('IP','')} / {p.get('Mask','')}  GW {p.get('Gateway') or '—'}"
+            elif mode == "DHCP": detail = f"Автоматический IP · {len(p.get('Routes', []))} маршрутов"
             else: detail = f"{len(p.get('Addresses', []))} IPv4 · {len(p.get('Routes', []))} маршрутов"
             if p.get("Category"): detail = f"[{p['Category']}] {detail}"
             self.tree.insert("", "end", iid=str(i), values=(p.get("Name", "Без названия"), mode_label, vlan, detail))
@@ -635,15 +688,21 @@ class NetworkManagerApp(tk.Tk):
         routes = list(state.get("Routes", []))
         gateways = state.get("Gateways", [])
         gateway = gateways[0] if gateways else ""
-        if gateway and (not addresses or len(addresses) > 1 or routes):
-            routes.insert(0, {"Destination": "0.0.0.0", "Mask": "0.0.0.0", "Gateway": gateway})
-
         profile: dict[str, Any] = {
             "Name": f"Текущие настройки {adapter_name}",
             "Category": "Сохранённые настройки",
             "VLAN": int(state["VlanValue"]) if str(state.get("VlanValue", "")).isdigit() else None,
         }
-        if len(addresses) == 1 and not routes:
+        dhcp_enabled = state.get("Dhcp") == "Enabled"
+        if dhcp_enabled:
+            profile["Mode"] = "DHCP"
+            if routes:
+                profile.update({"Routes": routes, "Persistent": False})
+        elif gateway and (not addresses or len(addresses) > 1 or routes):
+            routes.insert(0, {"Destination": "0.0.0.0", "Mask": "0.0.0.0", "Gateway": gateway})
+        if dhcp_enabled:
+            pass
+        elif len(addresses) == 1 and not routes:
             address = addresses[0]
             profile.update({"Mode": "Network", "IP": address["IPAddress"],
                             "Mask": mask_from(str(address["PrefixLength"])), "Gateway": gateway})
@@ -660,18 +719,8 @@ class NetworkManagerApp(tk.Tk):
             messagebox.showwarning("Сохранить профиль", "На адаптере не найдено IPv4-адресов или маршрутов, которые можно сохранить.", parent=self)
             self.status_var.set("Нет параметров для сохранения")
             return
-        if state.get("DnsServers"):
+        if not dhcp_enabled and state.get("DnsServers"):
             profile["DnsServers"] = state["DnsServers"]
-        if state.get("Dhcp") == "Enabled":
-            ips = ", ".join(a["IPAddress"] for a in addresses) or "адрес не получен"
-            save_as_static = messagebox.askyesno(
-                "Адаптер использует DHCP",
-                f"Текущие настройки получены автоматически. Сохранить адрес {ips} в профиле как статический?\n\n"
-                "После окончания аренды DHCP этот адрес может измениться.",
-                icon="warning", parent=self)
-            if not save_as_static:
-                self.status_var.set("Сохранение отменено")
-                return
         editor = ProfileEditor(self, profile, creating=True)
         self.wait_window(editor)
         if editor.result:
