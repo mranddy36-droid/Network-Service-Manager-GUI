@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
@@ -45,6 +46,31 @@ MODE_DESCRIPTIONS = {
     "Mixed": "Сначала назначает несколько IPv4-адресов, затем добавляет маршруты. Используйте, когда нужны и адреса для локальных подсетей, и пути к удалённым сетям. Можно указать VLAN.",
     "DHCP": "Автоматически получает IPv4-адрес, шлюз и DNS от DHCP-сервера. Можно задать VLAN и дополнительные маршруты. Ручные IPv4-поля не нужны.",
 }
+LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+
+class SessionLogHandler(logging.Handler):
+    """Keeps the complete current-session journal in memory for the GUI."""
+    def __init__(self, max_lines: int = 2000) -> None:
+        super().__init__(level=logging.INFO)
+        self.lines: deque[str] = deque(maxlen=max_lines)
+        self.setFormatter(LOG_FORMAT)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.lines.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+    def text(self) -> str:
+        self.acquire()
+        try:
+            return "\n".join(self.lines)
+        finally:
+            self.release()
+
+
+SESSION_LOG_HANDLER: SessionLogHandler | None = None
 
 
 def mode_from_label(label: str) -> str:
@@ -52,10 +78,17 @@ def mode_from_label(label: str) -> str:
 
 
 def setup_logging() -> None:
+    global SESSION_LOG_HANDLER
     LOG_DIR.mkdir(exist_ok=True)
-    logging.basicConfig(filename=LOG_DIR / f"BESKAR_{datetime.now():%Y-%m}.log",
-                        level=logging.INFO, encoding="utf-8",
-                        format="%(asctime)s %(levelname)s %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(LOG_DIR / f"BESKAR_{datetime.now():%Y-%m}.log", encoding="utf-8")
+    file_handler.setLevel(logging.ERROR)
+    file_handler.setFormatter(LOG_FORMAT)
+    SESSION_LOG_HANDLER = SessionLogHandler()
+    root.addHandler(file_handler)
+    root.addHandler(SESSION_LOG_HANDLER)
+    logging.info("Запуск приложения %s", APP_NAME)
 
 
 def run_powershell(script: str, timeout: int = 45) -> str:
@@ -448,7 +481,11 @@ class NetworkManagerApp(tk.Tk):
         self.adapter_var = tk.StringVar()
         self.object_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Загрузка адаптеров…")
+        self.last_log_text = ""
         self.build_ui()
+        self.refresh_log()
+        self.after(1000, self.auto_refresh_log)
+        logging.info("Графический интерфейс инициализирован")
         self.refresh_adapters()
 
     @staticmethod
@@ -509,12 +546,31 @@ class NetworkManagerApp(tk.Tk):
         ttk.Button(actions, text="＋ Создать профиль", command=self.add_profile).pack(side="left", padx=(0, 5))
         ttk.Button(actions, text="Изменить", command=self.edit_profile).pack(side="left", padx=(0, 5))
         ttk.Button(actions, text="Удалить", command=self.delete_profile).pack(side="left")
-        ttk.Label(right, text="Состояние адаптера", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
-        self.state_text = tk.Text(right, height=11, wrap="word", state="disabled", font=("Consolas", 10))
+        self.info_tabs = ttk.Notebook(right)
+        self.info_tabs.pack(fill="both", expand=True)
+        info_tab = ttk.Frame(self.info_tabs, padding=2)
+        self.log_tab = ttk.Frame(self.info_tabs, padding=2)
+        self.info_tabs.add(info_tab, text="Состояние и профиль")
+        self.info_tabs.add(self.log_tab, text="Журнал")
+        self.info_tabs.bind("<<NotebookTabChanged>>", self.on_info_tab_changed)
+        ttk.Label(info_tab, text="Состояние адаптера", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
+        self.state_text = tk.Text(info_tab, height=11, wrap="word", state="disabled", font=("Consolas", 10))
         self.state_text.pack(fill="x", pady=(0, 10))
-        ttk.Label(right, text="Выбранный профиль", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
-        self.detail_text = tk.Text(right, wrap="word", state="disabled", font=("Consolas", 10))
+        ttk.Label(info_tab, text="Выбранный профиль", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 5))
+        self.detail_text = tk.Text(info_tab, wrap="word", state="disabled", font=("Consolas", 10))
         self.detail_text.pack(fill="both", expand=True)
+        log_head = ttk.Frame(self.log_tab); log_head.pack(fill="x", pady=(0, 6))
+        ttk.Label(log_head, text="Журнал работы", font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Label(self.log_tab, text="Обновляется автоматически. Показывается полный журнал текущего запуска; в файл сохраняются только ошибки и критические события.",
+                  foreground="#687386", wraplength=420).pack(anchor="w", pady=(0, 6))
+        log_body = ttk.Frame(self.log_tab); log_body.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_body, wrap="none", state="disabled", font=("Consolas", 9))
+        log_vertical = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview)
+        log_horizontal = ttk.Scrollbar(log_body, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=log_vertical.set, xscrollcommand=log_horizontal.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew"); log_vertical.grid(row=0, column=1, sticky="ns")
+        log_horizontal.grid(row=1, column=0, sticky="ew")
+        log_body.rowconfigure(0, weight=1); log_body.columnconfigure(0, weight=1)
         bottom = ttk.Frame(self); bottom.pack(fill="x")
         ttk.Button(bottom, text="Проверить связь (ping)", command=self.manual_ping).pack(side="left", padx=(0, 6))
         ttk.Label(bottom, textvariable=self.status_var, anchor="e").pack(side="right", fill="x", expand=True)
@@ -536,11 +592,12 @@ class NetworkManagerApp(tk.Tk):
         style.configure("TCombobox", fieldbackground=panel, foreground=fg, arrowcolor=fg)
         style.configure("Treeview", background=panel, foreground=fg, fieldbackground=panel, rowheight=27)
         style.map("Treeview", background=[("selected", select)], foreground=[("selected", "white")])
-        for widget in (getattr(self, "state_text", None), getattr(self, "detail_text", None)):
+        for widget in (getattr(self, "state_text", None), getattr(self, "detail_text", None), getattr(self, "log_text", None)):
             if widget: widget.configure(bg=panel, fg=fg, insertbackground=fg)
 
     def toggle_theme(self) -> None:
         self.settings["dark"] = not self.settings.get("dark", True); self.save_settings()
+        logging.info("Тема интерфейса: %s", "тёмная" if self.settings["dark"] else "светлая")
         if self.settings["dark"]: self.set_dark()
         else: self.set_light()
 
@@ -548,7 +605,7 @@ class NetworkManagerApp(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("vista" if "vista" in style.theme_names() else "clam")
         self.configure(bg="#f0f0f0")
-        for widget in (getattr(self, "state_text", None), getattr(self, "detail_text", None)):
+        for widget in (getattr(self, "state_text", None), getattr(self, "detail_text", None), getattr(self, "log_text", None)):
             if widget: widget.configure(bg="white", fg="#20242b", insertbackground="#20242b")
 
     def selected_adapter(self) -> str:
@@ -557,17 +614,21 @@ class NetworkManagerApp(tk.Tk):
         return name
 
     def refresh_adapters(self) -> None:
+        logging.info("Запрошено обновление списка сетевых адаптеров")
         def work():
             try:
                 items = self.backend.adapters()
                 self.after(0, lambda: self.show_adapters(items))
             except Exception as e:
                 error_text = str(e)
+                logging.exception("Не удалось прочитать список адаптеров")
+                self.after(0, self.refresh_log)
                 self.after(0, lambda: (self.status_var.set("Ошибка чтения адаптеров"), messagebox.showerror("Адаптеры", f"{error_text}\n\nЗапустите приложение в Windows.")))
         threading.Thread(target=work, daemon=True).start()
 
     def show_adapters(self, items: list[dict[str, Any]]) -> None:
         self.adapters = items
+        logging.info("Получен список адаптеров: %d", len(items))
         values = [f"{a['Name']}  ·  {a.get('Status','')}  ·  {a.get('InterfaceDescription','')}" for a in items]
         self.adapter_combo["values"] = values
         if values and (not self.adapter_var.get() or not any(v.startswith(self.adapter_var.get().split("  ·  ")[0] + "  ·") for v in values)):
@@ -579,10 +640,12 @@ class NetworkManagerApp(tk.Tk):
     def refresh_state(self) -> None:
         if not self.adapter_var.get(): return
         name = self.selected_adapter()
+        logging.info("Запрошено состояние адаптера %s", name)
         self.status_var.set("Получение состояния…")
         def work():
             try:
                 s = self.backend.state(name)
+                logging.info("Состояние адаптера %s получено", name)
                 try:
                     self.backend.ensure_snapshot(name, s)
                     snapshot_error = ""
@@ -602,6 +665,8 @@ class NetworkManagerApp(tk.Tk):
                 self.after(0, show)
             except Exception as e:
                 error_text = str(e)
+                logging.exception("Не удалось прочитать состояние адаптера %s", name)
+                self.after(0, self.refresh_log)
                 self.after(0, lambda: self.status_var.set(f"Не удалось прочитать состояние: {error_text}"))
         threading.Thread(target=work, daemon=True).start()
 
@@ -609,9 +674,29 @@ class NetworkManagerApp(tk.Tk):
     def set_text(widget: tk.Text, value: str) -> None:
         widget.configure(state="normal"); widget.delete("1.0", "end"); widget.insert("1.0", value); widget.configure(state="disabled")
 
+    def refresh_log(self) -> None:
+        text = SESSION_LOG_HANDLER.text() if SESSION_LOG_HANDLER else "Журнал ещё не инициализирован."
+        if not text:
+            text = "Журнал пока пуст. Здесь появятся сведения о действиях программы и ошибках."
+        if text == self.last_log_text:
+            return
+        self.set_text(self.log_text, text)
+        self.log_text.see("end")
+        self.last_log_text = text
+
+    def auto_refresh_log(self) -> None:
+        if self.info_tabs.select() == str(self.log_tab):
+            self.refresh_log()
+        self.after(1000, self.auto_refresh_log)
+
+    def on_info_tab_changed(self, _event=None) -> None:
+        if self.info_tabs.select() == str(self.log_tab):
+            self.refresh_log()
+
     def load_objects(self) -> None:
         PROFILES_DIR.mkdir(exist_ok=True)
         names = sorted(p.stem for p in PROFILES_DIR.glob("*.json") if not p.name.endswith(".json.bak"))
+        logging.info("Найдено объектов с профилями: %d", len(names))
         self.object_combo["values"] = names
         if names:
             if self.object_var.get() not in names: self.object_var.set(names[0])
@@ -626,7 +711,9 @@ class NetworkManagerApp(tk.Tk):
             data = json.loads(path.read_text(encoding="utf-8-sig"))
             self.profiles = data if isinstance(data, list) else [data]
             self.object_path = path; self.render_profiles()
+            logging.info("Загружен объект профилей %s: %d профилей", path.stem, len(self.profiles))
         except Exception as e:
+            logging.exception("Не удалось загрузить объект профилей %s", path)
             messagebox.showerror("Ошибка объекта", str(e)); self.profiles = []; self.render_profiles()
 
     def render_profiles(self) -> None:
@@ -661,6 +748,7 @@ class NetworkManagerApp(tk.Tk):
             self.object_path.with_suffix(self.object_path.suffix + ".bak").write_bytes(self.object_path.read_bytes())
         self.object_path.write_text(json.dumps(self.profiles, ensure_ascii=False, indent=2), encoding="utf-8")
         self.render_profiles()
+        logging.info("Сохранён объект профилей %s: %d профилей", self.object_path.stem, len(self.profiles))
 
     def new_object(self) -> None:
         name = simpledialog.askstring("Новый объект", "Название объекта:", parent=self)
@@ -671,6 +759,7 @@ class NetworkManagerApp(tk.Tk):
         path = PROFILES_DIR / f"{name}.json"
         if path.exists(): messagebox.showerror("Объект", "Объект с таким именем уже есть."); return
         path.write_text("[]", encoding="utf-8"); self.object_var.set(name); self.load_objects()
+        logging.info("Создан объект профилей %s", name)
 
     def rename_object(self) -> None:
         if not self.object_path: return
@@ -680,6 +769,7 @@ class NetworkManagerApp(tk.Tk):
             messagebox.showerror("Объект", "Недопустимое или занятое имя."); return
         old = self.object_path; new = PROFILES_DIR / f"{name}.json"; old.rename(new)
         self.object_var.set(name); self.load_objects()
+        logging.info("Переименован объект профилей %s в %s", old.stem, name)
 
     def add_profile(self) -> None:
         if not self.object_path:
@@ -687,8 +777,12 @@ class NetworkManagerApp(tk.Tk):
         editor = ProfileEditor(self, creating=True); self.wait_window(editor)
         if editor.result:
             self.profiles.append(editor.result)
-            try: self.save_profiles()
-            except Exception as e: messagebox.showerror("Сохранение", str(e))
+            try:
+                self.save_profiles()
+                logging.info("Создан профиль %s", editor.result.get("Name", "Без названия"))
+            except Exception as e:
+                logging.exception("Не удалось сохранить новый профиль")
+                messagebox.showerror("Сохранение", str(e))
 
     def edit_profile(self) -> None:
         item = self.current_profile()
@@ -696,8 +790,12 @@ class NetworkManagerApp(tk.Tk):
         i, p = item; editor = ProfileEditor(self, p); self.wait_window(editor)
         if editor.result:
             self.profiles[i] = editor.result
-            try: self.save_profiles()
-            except Exception as e: messagebox.showerror("Сохранение", str(e))
+            try:
+                self.save_profiles()
+                logging.info("Изменён профиль %s", editor.result.get("Name", "Без названия"))
+            except Exception as e:
+                logging.exception("Не удалось сохранить изменения профиля")
+                messagebox.showerror("Сохранение", str(e))
 
     def save_current_as_profile(self) -> None:
         if not self.object_path:
@@ -764,7 +862,9 @@ class NetworkManagerApp(tk.Tk):
             try:
                 self.save_profiles()
                 self.status_var.set("Текущие настройки сохранены как новый профиль")
+                logging.info("Текущие настройки адаптера %s сохранены как профиль", adapter_name)
             except Exception as e:
+                logging.exception("Не удалось сохранить текущие настройки как профиль")
                 messagebox.showerror("Сохранение", str(e), parent=self)
 
     def delete_profile(self) -> None:
@@ -773,8 +873,12 @@ class NetworkManagerApp(tk.Tk):
         i, p = item
         if messagebox.askyesno("Удалить профиль", f"Удалить профиль «{p.get('Name')}»?", parent=self):
             del self.profiles[i]
-            try: self.save_profiles()
-            except Exception as e: messagebox.showerror("Сохранение", str(e))
+            try:
+                self.save_profiles()
+                logging.info("Удалён профиль %s", p.get("Name", "Без названия"))
+            except Exception as e:
+                logging.exception("Не удалось удалить профиль %s", p.get("Name", "Без названия"))
+                messagebox.showerror("Сохранение", str(e))
 
     def apply_selected(self) -> None:
         item = self.current_profile()
@@ -794,6 +898,7 @@ class NetworkManagerApp(tk.Tk):
         def work():
             try:
                 action(); logging.info("%s: success", pending)
+                self.after(0, self.refresh_log)
                 def completed():
                     self.status_var.set(success)
                     messagebox.showinfo("Готово", success, parent=self)
@@ -803,6 +908,7 @@ class NetworkManagerApp(tk.Tk):
                 error_text = str(e)
                 display_error = user_friendly_error(e)
                 logging.exception("%s failed", pending)
+                self.after(0, self.refresh_log)
                 self.after(0, lambda: (self.status_var.set("Операция завершилась ошибкой"), messagebox.showerror("Ошибка операции", display_error, parent=self)))
             finally:
                 if refresh: self.after(1500, self.refresh_state)
@@ -834,11 +940,14 @@ class NetworkManagerApp(tk.Tk):
                 assert result is not None
                 output = result.stdout[-3500:] or result.stderr
                 logging.info("Ping %s exit=%s", target, result.returncode)
+                self.after(0, self.refresh_log)
                 message = output + ("\nУзел отвечает." if not result.returncode else "\nОтвет не получен.")
                 if not automatic or result.returncode:
                     self.after(0, lambda: messagebox.showinfo(f"Ping · {target}", message, parent=self))
             except Exception as e:
                 error_text = str(e)
+                logging.exception("Ошибка проверки связи с %s", target)
+                self.after(0, self.refresh_log)
                 self.after(0, lambda: messagebox.showerror("Ping", error_text, parent=self))
         threading.Thread(target=ping, daemon=True).start()
 
